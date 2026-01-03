@@ -1,6 +1,7 @@
+from datetime import time
 from typing import Optional
 
-from homeassistant.components.select import SelectEntity
+from homeassistant.components.time import TimeEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
@@ -11,13 +12,14 @@ from homeassistant.const import (
     CONF_MODEL,
     CONF_NAME,
     CONF_TYPE,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
 )
 
 from .API.const import DeviceTypes
 from .API.device_type.storage_120 import ChargeDischargeMode, ChargeDischargePeriodValue
-from .sensor_types.inverter import INVERTER_SELECT_TYPES_W_METER
-from .sensor_types.storage import STORAGE_SELECT_TYPES
-from .sensor_types.select_entity_description import GrowattSelectEntityDescription
+from .sensor_types.storage import STORAGE_TIME_TYPES
+from .sensor_types.time_entity_description import GrowattTimeEntityDescription
 from . import GrowattLocalCoordinator
 from .const import (
     CONF_FIRMWARE,
@@ -33,23 +35,13 @@ async def async_setup_entry(
 ) -> None:
     coordinator: GrowattLocalCoordinator = hass.data[DOMAIN][config_entry.data[CONF_SERIAL_NUMBER]]
     entities = []
-    sensor_descriptions: list[GrowattSelectEntityDescription] = []
+    sensor_descriptions: list[GrowattTimeEntityDescription] = []
     supported_key_names = coordinator.growatt_api.get_register_names()
 
     device_type = DeviceTypes(config_entry.data[CONF_TYPE])
-    meter_connected = config_entry.data.get(CONF_METER_CONNECTED, False)
-
-    if device_type in (DeviceTypes.INVERTER, DeviceTypes.INVERTER_315, DeviceTypes.INVERTER_120,
-                       DeviceTypes.HYBRID_120, DeviceTypes.HYBRID_120_TL_XH):
-        if meter_connected:
-            for sensor in INVERTER_SELECT_TYPES_W_METER:
-                if sensor.key not in supported_key_names:
-                    continue
-                
-                sensor_descriptions.append(sensor)
     
     if device_type in (DeviceTypes.HYBRID_120, DeviceTypes.HYBRID_120_TL_XH, DeviceTypes.STORAGE_120):
-        for sensor in STORAGE_SELECT_TYPES:
+        for sensor in STORAGE_TIME_TYPES:
             if sensor.key not in supported_key_names:
                 continue
 
@@ -68,10 +60,10 @@ async def async_setup_entry(
 
     async_add_entities(entities, True)
 
-class GrowattDeviceEntity(CoordinatorEntity, RestoreEntity, SelectEntity):
+class GrowattDeviceEntity(CoordinatorEntity, RestoreEntity, TimeEntity):
     def __init__(self, coordinator, entry, description):
         super().__init__(coordinator, description.key)
-        self.entity_description: GrowattSelectEntityDescription = description
+        self.entity_description: GrowattTimeEntityDescription = description
         self._config_entry = entry
         self.charge_discharge_period_state = ChargeDischargePeriodValue()
 
@@ -98,10 +90,10 @@ class GrowattDeviceEntity(CoordinatorEntity, RestoreEntity, SelectEntity):
         if (state := await self.async_get_last_state()) is None:
             return
 
-        if state.state not in self.options:
+        if state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             return
 
-        self._attr_current_option = state.state
+        self._attr_native_value = time.fromisoformat(state.state)
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -109,28 +101,30 @@ class GrowattDeviceEntity(CoordinatorEntity, RestoreEntity, SelectEntity):
         if (state := self.coordinator.data.get(self.entity_description.key)) is None:
             return
 
-        if self.entity_description.charge_discharge_period_select:
+        if self.entity_description.charge_discharge_period_starttime:
             self.charge_discharge_period_state = state
-            self._attr_current_option = state.mode.value
+            self._attr_native_value = state.start_time
+        elif self.entity_description.charge_discharge_period_endtime:
+            self.charge_discharge_period_state = state
+            self._attr_native_value = state.end_time
         else:
-            if state not in self.options:
-                return
-            self._attr_current_option = state
+            return  # Not implemented
         self.async_write_ha_state()
 
-    async def async_select_option(self, option: str) -> None:
-        if self.entity_description.charge_discharge_period_select:
-            if option not in list(ChargeDischargeMode):
-                return
-            self.charge_discharge_period_state.mode = ChargeDischargeMode(option)
+    async def async_set_value(self, value: time) -> None:
+        if self.entity_description.charge_discharge_period_starttime:
+            self.charge_discharge_period_state.start_time = value
+            await self.coordinator.write_charge_discharge_period_registers(
+                    self.entity_description.key,
+                    self.charge_discharge_period_state
+                )
+        elif self.entity_description.charge_discharge_period_endtime:
+            self.charge_discharge_period_state.end_time = value
             await self.coordinator.write_charge_discharge_period_registers(
                     self.entity_description.key,
                     self.charge_discharge_period_state
                 )
         else:
-            value = next((k for k, v in self.entity_description.value_to_state_dict.items() if v == option), None)
-            if value is None:
-                return
-            await self.coordinator.write_register(self.entity_description.key, value)
-        self._attr_current_option = option
+            return  # Not implemented
+        self._attr_native_value = value
         self.async_write_ha_state()
